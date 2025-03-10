@@ -260,40 +260,25 @@ def predict(model, waveform, device):
             'spectral_centroid': 4000.0
         }
     
-    # Make sure the waveform is properly formatted
-    try:
-        # Ensure the waveform has the right shape and data format
-        print(f"[DEBUG] Waveform stats - min: {waveform.min().item()}, max: {waveform.max().item()}, mean: {waveform.mean().item()}")
-        
-        # Explicitly reshape to ensure [batch, channels, time]
-        if isinstance(model, SimplifiedModel):
-            # SimplifiedModel handles shape internally
-            pass
-        else:
-            # Ensure we have correct shape for the original model
-            if waveform.dim() == 1:
-                waveform = waveform.unsqueeze(0).unsqueeze(0)
-            elif waveform.dim() == 2:
-                if waveform.shape[0] == 1:  # [batch, time]
-                    waveform = waveform.unsqueeze(1)  # [batch, channels, time]
-                else:  # [channels, time]
-                    waveform = waveform.unsqueeze(0)  # [batch, channels, time]
-        
-        print(f"[DEBUG] Final waveform shape before model: {waveform.shape}")
-        
-        # Try normalization to prevent numerical issues
-        if waveform.abs().max() > 0:
-            waveform = waveform / waveform.abs().max()
-            print("[DEBUG] Waveform normalized to range [-1, 1]")
-    except Exception as e:
-        print(f"[WARNING] Error in waveform preprocessing: {e}")
+    # THE FIX: Reshape the waveform for RawNet2 model
+    # The model expects [batch_size, seq_length] format, not [batch_size, channels, seq_length]
+    if not isinstance(model, SimplifiedModel):
+        if waveform.dim() == 3:  # If shape is [batch, channel, time]
+            waveform = waveform.squeeze(1)  # Remove channel dimension -> [batch, time]
+            print(f"[DEBUG] Reshaped waveform for RawNet2: {waveform.shape}")
     
-    # Process with model
     with torch.no_grad():
         try:
             # Try running the model with careful error handling
             print("[DEBUG] Running model inference...")
-            output = model(waveform)
+            
+            # THE FIX: Different model call based on model type
+            if isinstance(model, SimplifiedModel):
+                output = model(waveform)
+            else:
+                # RawNet2 model returns two outputs: (hidden, output)
+                _, output = model(waveform)
+            
             print(f"[DEBUG] Model output shape: {output.shape}")
             
             # Get probabilities
