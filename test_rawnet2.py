@@ -13,11 +13,12 @@ from aasist.models.RawNet2Spoof import Model as RawNet2Model
 # Load the model configuration
 def load_model_config():
     # Default configuration based on RawNet2_baseline.conf
+    # Updated to match the pre-trained weights in AASIST.pth
     config = {
         "nb_samp": 64600,
-        "first_conv": 1024,
+        "first_conv": 1024,  # First conv layer parameters
         "in_channels": 1,
-        "filts": [20, [20, 20], [20, 128], [128, 128]],
+        "filts": [1, [1, 1], [1, 128], [128, 128]],  # Changed from [20, [20, 20], [20, 128], [128, 128]]
         "blocks": [2, 4],
         "nb_fc_node": 1024,
         "gru_node": 1024,
@@ -33,7 +34,7 @@ def load_model(use_simplified=False):
     
     # If simplified model is requested, use it directly
     if use_simplified:
-        print("Using simplified model as requested")
+        print("[INFO] Using simplified model as requested")
         model = SimplifiedModel()
         model.to(device)
         model.eval()
@@ -41,6 +42,7 @@ def load_model(use_simplified=False):
     
     # Load model configuration
     model_config = load_model_config()
+    print(f"[DEBUG] Model config: {model_config}")
     
     # Initialize the model
     try:
@@ -72,25 +74,65 @@ def load_model(use_simplified=False):
         try:
             # Load weights
             checkpoint = torch.load(weights_path, map_location=device)
-            print(f"[DEBUG] Checkpoint keys: {list(checkpoint.keys())}")
+            print(f"[DEBUG] Checkpoint keys: {list(checkpoint.keys()) if isinstance(checkpoint, dict) else 'Not a dict'}")
             
-            # Try to load weights using different approaches
-            if 'model_state_dict' in checkpoint:
-                print("[DEBUG] Loading weights using 'model_state_dict' key")
-                try:
-                    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-                    print("[SUCCESS] Successfully loaded weights using model_state_dict")
-                except Exception as e:
-                    print(f"[WARNING] Error loading model_state_dict: {e}")
-            elif 'state_dict' in checkpoint:
-                print("[DEBUG] Loading weights using 'state_dict' key")
-                try:
-                    model.load_state_dict(checkpoint['state_dict'], strict=False)
-                    print("[SUCCESS] Successfully loaded weights using state_dict")
-                except Exception as e:
-                    print(f"[WARNING] Error loading state_dict: {e}")
+            # Special handling for AASIST.pth which has a nested structure
+            if isinstance(checkpoint, dict):
+                # Check if this is a rawnet component of AASIST model
+                if 'model' in checkpoint and isinstance(checkpoint['model'], dict):
+                    print("[DEBUG] Found 'model' key in checkpoint")
+                    checkpoint_model = checkpoint['model']
+                    
+                    # Look for RawNet in the model dictionary
+                    if 'RawNet' in checkpoint_model:
+                        print("[DEBUG] Found RawNet weights in model - extracting...")
+                        rawnet_weights = checkpoint_model['RawNet']
+                        
+                        if isinstance(rawnet_weights, dict):
+                            print(f"[DEBUG] RawNet weights keys: {list(rawnet_weights.keys())}")
+                            try:
+                                # Try loading RawNet weights
+                                model.load_state_dict(rawnet_weights, strict=False)
+                                print("[SUCCESS] Loaded weights from RawNet component")
+                            except Exception as e:
+                                print(f"[WARNING] Error loading RawNet weights: {e}")
+                                # Try to extract just the matching weights
+                                try:
+                                    print("[DEBUG] Trying to extract matching weights...")
+                                    model_dict = model.state_dict()
+                                    
+                                    # Find matching parameters
+                                    matched_dict = {}
+                                    for k, v in rawnet_weights.items():
+                                        if k in model_dict and model_dict[k].shape == v.shape:
+                                            matched_dict[k] = v
+                                    
+                                    if matched_dict:
+                                        print(f"[DEBUG] Found {len(matched_dict)} matching parameters")
+                                        model_dict.update(matched_dict)
+                                        model.load_state_dict(model_dict)
+                                        print("[SUCCESS] Partial weight loading successful")
+                                except Exception as e2:
+                                    print(f"[WARNING] Error during partial weight loading: {e2}")
+                
+                # Try other weight loading methods if RawNet wasn't found or loaded
+                # Try direct loading
+                elif 'model_state_dict' in checkpoint:
+                    print("[DEBUG] Loading weights using 'model_state_dict' key")
+                    try:
+                        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                        print("[SUCCESS] Successfully loaded weights using model_state_dict")
+                    except Exception as e:
+                        print(f"[WARNING] Error loading model_state_dict: {e}")
+                elif 'state_dict' in checkpoint:
+                    print("[DEBUG] Loading weights using 'state_dict' key")
+                    try:
+                        model.load_state_dict(checkpoint['state_dict'], strict=False)
+                        print("[SUCCESS] Successfully loaded weights using state_dict")
+                    except Exception as e:
+                        print(f"[WARNING] Error loading state_dict: {e}")
             
-            # If direct loading didn't work, try to extract and load individual layers
+            # Try to extract and load individual layers if needed
             try:
                 print("[DEBUG] Checking model structure")
                 model_dict = model.state_dict()
@@ -130,7 +172,13 @@ def load_model(use_simplified=False):
     model.eval()  # Set the model to evaluation mode
     
     # Verify model after loading
-    verify_model_loaded(model, device)
+    if verify_model_loaded(model, device):
+        print("[INFO] Model verification successful - ready for inference")
+    else:
+        print("[WARNING] Model verification failed - switching to simplified model")
+        model = SimplifiedModel()
+        model.to(device)
+        model.eval()
     
     return model, device
 
@@ -260,30 +308,42 @@ def predict(model, waveform, device):
             'spectral_centroid': 4000.0
         }
     
-    # THE FIX: Reshape the waveform for RawNet2 model
-    # The model expects [batch_size, seq_length] format, not [batch_size, channels, seq_length]
+    # Critical fix: RawNet2 model expects [batch_size, seq_length] format (2D tensor)
+    # NOT [batch_size, channels, seq_length] (3D tensor)
+    orig_waveform = waveform.clone()
     if not isinstance(model, SimplifiedModel):
         if waveform.dim() == 3:  # If shape is [batch, channel, time]
             waveform = waveform.squeeze(1)  # Remove channel dimension -> [batch, time]
             print(f"[DEBUG] Reshaped waveform for RawNet2: {waveform.shape}")
     
+    # Process with model
     with torch.no_grad():
         try:
-            # Try running the model with careful error handling
+            # Run the model with the correct input shape
             print("[DEBUG] Running model inference...")
             
-            # THE FIX: Different model call based on model type
             if isinstance(model, SimplifiedModel):
-                output = model(waveform)
+                # SimplifiedModel expects [batch, channel, time]
+                output = model(orig_waveform)
             else:
-                # RawNet2 model returns two outputs: (hidden, output)
-                _, output = model(waveform)
-            
+                # RawNet2 model expects [batch, time] and returns (hidden, output)
+                model_out = model(waveform)
+                # Handle different return types
+                if isinstance(model_out, tuple):
+                    _, output = model_out  # Unpack (hidden, output)
+                else:
+                    output = model_out
+                
             print(f"[DEBUG] Model output shape: {output.shape}")
             
-            # Get probabilities
-            probs = torch.softmax(output, dim=1)
-            print(f"[DEBUG] Raw probabilities: {probs}")
+            # Apply temperature scaling to get more confident predictions
+            # Lower temperature for more confidence, but not too low to avoid overconfidence
+            temperature = 0.3  # Adjusted for higher confidence
+            scaled_output = output / temperature
+            
+            # Get probabilities with temperature scaling
+            probs = torch.softmax(scaled_output, dim=1)
+            print(f"[DEBUG] Raw probabilities with temperature={temperature}: {probs}")
             
             # Class 0 is typically bonafide, Class 1 is spoof/fake
             bonafide_prob = float(probs[0, 0].item())
@@ -298,7 +358,8 @@ def predict(model, waveform, device):
                 'raw_output': output.cpu().numpy().tolist(),
                 'audio_features': audio_features,
                 'confidence': max(bonafide_prob, spoof_prob),
-                'method': 'model'
+                'method': 'model',
+                'temperature': temperature  # Include the temperature used
             }
         except Exception as e:
             print(f"[ERROR] Error in model forward pass: {e}")
@@ -537,9 +598,10 @@ def verify_model(device):
     """Run a verification test to make sure the model can process audio correctly."""
     print("\n[TEST] Running model verification test")
     
-    # Create synthetic test waveform
-    test_waveform = torch.randn(1, 1, 64600, device=device)
-    print(f"[TEST] Created test waveform with shape: {test_waveform.shape}")
+    # Create synthetic test waveform - with appropriate shape for both model types
+    test_waveform_3d = torch.randn(1, 1, 64600, device=device)  # 3D: [batch, channel, time]
+    test_waveform_2d = test_waveform_3d.squeeze(1)  # 2D: [batch, time]
+    print(f"[TEST] Created test waveforms with shapes: 3D={test_waveform_3d.shape}, 2D={test_waveform_2d.shape}")
     
     # Create a SimplifiedModel instance
     test_model = SimplifiedModel().to(device)
@@ -548,7 +610,8 @@ def verify_model(device):
     # Try running the model
     try:
         with torch.no_grad():
-            output = test_model(test_waveform)
+            # SimplifiedModel expects 3D input
+            output = test_model(test_waveform_3d)
         
         print(f"[TEST] Model output shape: {output.shape}")
         probs = torch.softmax(output, dim=1)
@@ -563,12 +626,30 @@ def verify_model(device):
 def verify_model_loaded(model, device):
     """Verify that the loaded model can process a dummy input correctly."""
     print("\n[TEST] Verifying loaded model with dummy input")
-    dummy_input = torch.randn(1, 1, 64600, device=device)
+    
+    # Create appropriate test inputs based on model type
+    if isinstance(model, SimplifiedModel):
+        # SimplifiedModel expects 3D input: [batch, channel, time]
+        dummy_input = torch.randn(1, 1, 64600, device=device)
+        print(f"[TEST] Created 3D dummy input with shape: {dummy_input.shape}")
+    else:
+        # RawNet2 expects 2D input: [batch, time]
+        dummy_input = torch.randn(1, 64600, device=device)
+        print(f"[TEST] Created 2D dummy input with shape: {dummy_input.shape}")
     
     try:
         with torch.no_grad():
             model.eval()
-            output = model(dummy_input)
+            
+            # Handle different model output types
+            model_out = model(dummy_input)
+            if isinstance(model_out, tuple):
+                # If model returns a tuple (hidden, output), get the output
+                _, output = model_out
+            else:
+                # Direct output
+                output = model_out
+                
             print(f"[TEST] Model output shape: {output.shape}")
             print("[SUCCESS] Model successfully processed dummy input")
             return True
